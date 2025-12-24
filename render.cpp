@@ -16,20 +16,16 @@ Trill trill;
 Gui gui;
 GuiController controller;
 
-// Slider indices (returned by addSlider)
+// Slider indices
 int scanSpeedIdx = -1;
 int grainDensityIdx = -1;
 int delayFeedbackIdx = -1;
 
-// GUI parameters (default values – will be updated by sliders)
-float scanSpeed = 0.4f;
-float grainDensity = 0.5f;
-float delayFeedback = 0.5f;
+// Base GUI parameters
+float baseScanSpeed = 0.4f;
+float baseGrainDensity = 0.5f;
+float baseDelayFeedback = 0.5f;
 
-// Trill values
-float touchX = 0.5f;
-float touchY = 0.5f;
-float touchSize = 0.0f;
 bool trillDetected = false;
 
 // Granular control
@@ -42,12 +38,6 @@ void readTrillLoop(void*)
     while (!Bela_stopRequested()) {
         if (trillDetected) {
             trill.readI2C();
-            float x = trill.compoundTouchHorizontalLocation();
-            float y = trill.compoundTouchLocation();
-            float size = trill.compoundTouchSize();
-            if (x >= 0.0f) touchX = x;
-            if (y >= 0.0f) touchY = y;
-            if (size >= 0.0f) touchSize = size;
         }
         usleep(5000);
     }
@@ -68,17 +58,16 @@ bool setup(BelaContext* context, void* userData)
 
     // GUI setup
     gui.setup(context->projectName);
-    controller.setup(&gui, "Controls");  // Attach controller to gui with a folder name
+    controller.setup(&gui, "Controls");
 
-    // Add sliders and store their indices
     scanSpeedIdx     = controller.addSlider("Scan Speed",     0.4f, 0.0f, 1.0f, 0.01f);
     grainDensityIdx  = controller.addSlider("Grain Density",  0.5f, 0.0f, 1.0f, 0.01f);
     delayFeedbackIdx = controller.addSlider("Delay Feedback", 0.5f, 0.0f, 1.0f, 0.01f);
 
-    // Trill Flex (optional)
-    if (trill.setup(1, Trill::FLEX, 0x28) == 0) {
+    // Trill Square setup - CENTROID mode for reliable single-touch X/Y + size
+    if (trill.setup(1, Trill::SQUARE, 0x28) == 0) {
         trillDetected = true;
-        trill.setMode(Trill::CENTROID);
+        trill.setMode(Trill::CENTROID);  // Best for accurate X/Y position + size on Square
         trill.setNoiseThreshold(0.06f);
         trill.setScanSettings(3, 12);
     } else {
@@ -93,37 +82,81 @@ bool setup(BelaContext* context, void* userData)
 
 void render(BelaContext* context, void* userData)
 {
-    // Update parameters from GUI sliders
-    scanSpeed     = controller.getSliderValue(scanSpeedIdx);
-    grainDensity  = controller.getSliderValue(grainDensityIdx);
-    delayFeedback = controller.getSliderValue(delayFeedbackIdx);
+    // Update base parameters from GUI
+    baseScanSpeed     = controller.getSliderValue(scanSpeedIdx);
+    baseGrainDensity  = controller.getSliderValue(grainDensityIdx);
+    baseDelayFeedback = controller.getSliderValue(delayFeedbackIdx);
 
     int sampleLength = granular->getAudioSampleLength();
     int grainSizeSamples = granular->getGrainSizeSamples();
     float sr = context->audioSampleRate;
 
     for (unsigned int n = 0; n < context->audioFrames; n++) {
-        bool touched = trillDetected && (touchSize > 0.02f);
+        float touchX = 0.5f;
+        float touchY = 0.5f;
+        float touchSize = 0.0f;
+        bool touched = false;
 
-        // Scan speed
-        float baseSpeed = 0.1f + scanSpeed * 0.6f;
-        float trillSpeed = touched ? (0.1f + touchX * 0.6f) : baseSpeed;
-        float speedFactor = trillDetected ? (trillSpeed * 0.5f + baseSpeed * 0.5f) : baseSpeed;
+        if (trillDetected) {
+            float x = trill.compoundTouchHorizontalLocation();  // X position (0-1 left to right)
+            float y = trill.compoundTouchLocation();           // Y position (0-1 bottom to top)
+            float size = trill.compoundTouchSize();            // Pressure-like size
+
+            if (size > 0.02f) {
+                touchX = x >= 0 ? x : 0.5f;
+                touchY = y >= 0 ? y : 0.5f;
+                touchSize = size;
+                touched = true;
+            }
+        }
+
+        // === 5 expressive parameters from single touch on Trill Square ===
+        // 1. -X (left side): reverse scan speed
+        float leftInfluence = (1.0f - touchX) * touchSize;   // Stronger when left + pressed
+
+        // 2. +X (right side): forward scan speed + longer delay time
+        float rightInfluence = touchX * touchSize;          // Stronger when right + pressed
+
+        // 3. -Y (bottom): higher grain density
+        float bottomInfluence = (1.0f - touchY) * touchSize;
+
+        // 4. +Y (top): higher delay feedback
+        float topInfluence = touchY * touchSize;
+
+        // 5. Pressure (touchSize): higher diffusion (washier delay)
+        float pressure = touchSize;
+
+        // Scan speed/direction
+        float speedFactor = 0.1f + baseScanSpeed * 0.6f + (rightInfluence - leftInfluence) * 0.8f;
 
         // Grain density
-        float baseDensity = 0.3f + grainDensity * 5.7f;
-        float trillDensity = touched ? (1.0f + touchSize * 5.0f) : baseDensity;
-        float density = trillDetected ? (trillDensity * 0.5f + baseDensity * 0.5f) : baseDensity;
+        float density = 0.3f + baseGrainDensity * 5.7f + bottomInfluence * 4.0f;
 
+        // Delay time (longer toward right)
+        float delayTimeMs = 300.0f + rightInfluence * 800.0f;
+
+        // Delay feedback (more toward top)
+        float feedback = 0.3f + baseDelayFeedback * 0.6f + topInfluence * 0.6f;
+
+        // Diffusion (stronger with pressure)
+        float diffusion = 0.15f + pressure * 0.65f;
+
+        // LFO for subtle variation
+        static float lfoPhase = 0.0f;
+        lfoPhase += 0.25f / sr;
+        if (lfoPhase >= 1.0f) lfoPhase -= 1.0f;
+        float lfo = sinf(lfoPhase * 2.0f * M_PI) * 12.0f;
+        delayTimeMs += lfo;
+
+        // Granular triggering
         float currentInterval = baseGrainInterval / density;
         grainTimer += 1.0f / sr;
         if (grainTimer >= currentInterval) {
             grainTimer -= currentInterval;
 
             scanPosition += speedFactor * grainSizeSamples;
-            if (scanPosition >= sampleLength - grainSizeSamples) {
-                scanPosition = 0.0f;
-            }
+            while (scanPosition >= sampleLength - grainSizeSamples) scanPosition -= (sampleLength - grainSizeSamples);
+            while (scanPosition < 0) scanPosition += (sampleLength - grainSizeSamples);
 
             int jitter = (rand() % (grainSizeSamples / 3)) - (grainSizeSamples / 6);
             int pos = static_cast<int>(scanPosition + jitter);
@@ -135,22 +168,9 @@ void render(BelaContext* context, void* userData)
         float out = granular->processGrains();
         out *= 0.38f;
 
-        // LFO for delay time variation
-        static float lfoPhase = 0.0f;
-        lfoPhase += 0.25f / sr;
-        if (lfoPhase >= 1.0f) lfoPhase -= 1.0f;
-        float lfo = sinf(lfoPhase * 2.0f * M_PI) * 12.0f;
-
-        float delayTimeMs = 500.0f + (trillDetected ? touchX : scanSpeed) * 600.0f + lfo;
-
-        // Delay feedback
-        float baseFeedback = 0.3f + delayFeedback * 0.6f;
-        float trillFeedback = touched ? (0.3f + touchY * 0.6f) : baseFeedback;
-        float feedback = trillDetected ? (trillFeedback * 0.5f + baseFeedback * 0.5f) : baseFeedback;
-
         delay->setTime(delayTimeMs);
         delay->setFeedback(feedback);
-        delay->setDiffusion(0.15f + (trillDetected ? touchSize : grainDensity) * 0.5f);
+        delay->setDiffusion(diffusion);
 
         out = delay->process(out);
 
