@@ -16,19 +16,15 @@ public:
     float processGrains();
     int getAudioSampleLength() const { return audioSampleLength; }
     int getGrainSizeSamples() const { return grainSizeSamples; }
-
 private:
     bool loadAudioSample(const std::string& filename);
     void initializeGrains();
-
     float sampleRate;
     float grainSizeMs;
     float playbackSpeed;
     int maxGrains;
-
     std::vector<float> audioSample;
     int audioSampleLength = 0;
     int grainSizeSamples = 0;
-
     std::vector<Grain> grains;
 };
